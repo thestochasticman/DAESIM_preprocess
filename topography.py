@@ -20,6 +20,12 @@ from matplotlib import colors
 from matplotlib.font_manager import FontProperties
 from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
 
+import json
+import gzip
+import base64
+from datetime import datetime
+
+
 topographic_variables = ['accumulation', 'aspect', 'slope', 'twi']
 
 # +
@@ -162,6 +168,168 @@ def plot_topography(ds, outdir='.', stub='Test', verbose=True):
     if verbose:
         print(f"Saved: {filepath}")
 
+
+def _encode_array_base64_gzip(arr: np.ndarray) -> dict:
+    """
+    Encode a 2D numpy array as base64(gzip(raw_bytes)).
+    Always stores row-major (C-contiguous) bytes.
+    """
+    arr = np.ascontiguousarray(arr)
+    raw = arr.tobytes(order="C")
+    comp = gzip.compress(raw, compresslevel=6)
+    b64 = base64.b64encode(comp).decode("ascii")
+    return {
+        "width": int(arr.shape[1]),
+        "height": int(arr.shape[0]),
+        "dtype": str(arr.dtype),
+        "encoding": "base64+gzip",
+        "data": b64,
+    }
+
+
+def _finite_stats(arr: np.ndarray) -> dict:
+    """
+    Stats ignoring NaNs and infs.
+    """
+    a = np.asarray(arr)
+    m = np.isfinite(a)
+    if not np.any(m):
+        return {"min": None, "max": None, "p2": None, "p98": None}
+    v = a[m].astype(np.float64)
+    return {
+        "min": float(np.min(v)),
+        "max": float(np.max(v)),
+        "p2": float(np.percentile(v, 2)),
+        "p98": float(np.percentile(v, 98)),
+    }
+
+
+def _build_aspect_sequential(aspect_arcgis: np.ndarray) -> np.ndarray:
+    """
+    Map ArcGIS D8 flow direction codes {1,2,4,8,16,32,64,128} -> {1..8}
+    Anything else -> 0
+    """
+    arcgis_dirs = np.array([1, 2, 4, 8, 16, 32, 64, 128], dtype=np.uint8)
+    sequential_dirs = np.array([1, 2, 3, 4, 5, 6, 7, 8], dtype=np.uint8)
+
+    out = np.zeros_like(aspect_arcgis, dtype=np.uint8)
+    for a, s in zip(arcgis_dirs, sequential_dirs):
+        out[aspect_arcgis == a] = s
+    return out
+
+
+def save_topography_react_json(ds: xr.Dataset, outdir: str, stub: str, verbose: bool = True) -> str:
+    """
+    Reproject layers to EPSG:4326, encode arrays, and save a single JSON
+    the backend can forward directly to the frontend.
+    """
+    # Reproject each layer with appropriate resampling
+    terrain4326 = ds["terrain"].rio.reproject("EPSG:4326", resampling=Resampling.bilinear)
+    slope4326 = ds["slope"].rio.reproject("EPSG:4326", resampling=Resampling.bilinear)
+    acc4326 = ds["accumulation"].rio.reproject("EPSG:4326", resampling=Resampling.bilinear)
+
+    # Aspect is categorical -> nearest
+    aspect4326_raw = ds["aspect"].rio.reproject("EPSG:4326", resampling=Resampling.nearest)
+
+    # Bounds/extent for plotting (lon/lat)
+    left, bottom, right, top = terrain4326.rio.bounds()
+    extent4326 = {"left": float(left), "right": float(right), "bottom": float(bottom), "top": float(top)}
+
+    # Convert to numpy (2D)
+    terrain = terrain4326.values
+    slope = slope4326.values
+    acc = acc4326.values
+    aspect_arcgis = aspect4326_raw.values.astype(np.uint8, copy=False)
+
+    # For React colorbar ticks, send sequential aspect 1..8
+    aspect_seq = _build_aspect_sequential(aspect_arcgis)
+
+    # Stats + norms (match your matplotlib intent)
+    terrain_stats = _finite_stats(terrain)
+    slope_stats = _finite_stats(slope)
+
+    # Accumulation log norm: vmin=1, vmax=maxFinite
+    acc_stats = _finite_stats(acc)
+    acc_vmax = acc_stats["max"] if acc_stats["max"] is not None else 1.0
+    if acc_vmax < 1:
+        acc_vmax = 1.0
+
+    payload = {
+        "kind": "topography.react.v1",
+        "created_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "extent4326": extent4326,
+        "layers": {
+            "terrain": {
+                **_encode_array_base64_gzip(terrain.astype(np.float32, copy=False)),
+                "nodata": "NaN",
+                "stats": terrain_stats,
+                "render": {
+                    "title": "Elevation",
+                    "cmap": "terrain",
+                    "norm": {"type": "linear", "vmin": terrain_stats["p2"], "vmax": terrain_stats["p98"]},
+                    "colorbar": {"label": "height above sea level (m)"},
+                    # optional: send contour hint if you want to implement later
+                    "contours": {"interval": 10},
+                    "axes": {"xlabel": "Longitude", "ylabel": "Latitude", "origin": "upper"},
+                },
+            },
+            "accumulation": {
+                **_encode_array_base64_gzip(acc.astype(np.float32, copy=False)),
+                "nodata": 0,
+                "stats": acc_stats,
+                "render": {
+                    "title": "Accumulation",
+                    "cmap": "cubehelix",
+                    "norm": {"type": "log", "vmin": 1.0, "vmax": float(acc_vmax)},
+                    "colorbar": {"label": "upstream cells"},
+                    "axes": {"xlabel": "Longitude", "ylabel": "Latitude", "origin": "upper"},
+                },
+            },
+            "aspect": {
+                **_encode_array_base64_gzip(aspect_seq.astype(np.uint8, copy=False)),
+                "nodata": 0,
+                "stats": {"min": 1, "max": 8, "p2": None, "p98": None},
+                "render": {
+                    "title": "Aspect",
+                    "cmap": "twilight_shifted",
+                    "norm": {"type": "discrete", "bins": 8, "vmin": 1, "vmax": 8},
+                    "colorbar": {
+                        "tickValues": [1, 2, 3, 4, 5, 6, 7, 8],
+                        "tickText": ["E", "SE", "S", "SW", "W", "NW", "N", "NE"],
+                    },
+                    "axes": {"xlabel": "Longitude", "ylabel": "Latitude", "origin": "upper"},
+                },
+            },
+            "slope": {
+                **_encode_array_base64_gzip(slope.astype(np.float32, copy=False)),
+                "nodata": "NaN",
+                "stats": slope_stats,
+                "render": {
+                    "title": "Slope",
+                    "cmap": "YlGn",
+                    "norm": {"type": "linear", "vmin": slope_stats["p2"], "vmax": slope_stats["p98"]},
+                    "colorbar": {"label": "degrees"},
+                    "axes": {"xlabel": "Longitude", "ylabel": "Latitude", "origin": "upper"},
+                },
+            },
+        },
+        "meta": {
+            "crs": "EPSG:4326",
+            "stub": stub,
+        },
+    }
+
+    outpath = os.path.join(outdir, f"{stub}_topography.react.json")
+    print(outpath, '-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------')
+    with open(outpath, "w") as f:
+        json.dump(payload, f)
+
+    if verbose:
+        print("Saved:", outpath)
+
+    return outpath
+
+
 def topography(outdir=".", stub="TEST", smooth=True, sigma=5, ds=None, savetifs=True, verbose=True, plot=True):
     """Derive topographic variables from the elevation. 
     This function assumes there already exists a file named (outdir)/(stub)_terrain.tif"
@@ -233,6 +401,8 @@ def topography(outdir=".", stub="TEST", smooth=True, sigma=5, ds=None, savetifs=
 
     if plot:
         plot_topography(ds, outdir, stub, verbose=verbose)
+        
+    save_topography_react_json(ds, outdir, stub, verbose=verbose)
 
     ds = ds.drop_vars('spatial_ref')
 
