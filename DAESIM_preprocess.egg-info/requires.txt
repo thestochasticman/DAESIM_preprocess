@@ -1,0 +1,16 @@
+rioxarray
+pandas
+scipy
+requests
+pysheds
+owslib
+pyproj
+matplotlib
+netcdf4
+
+[dev]
+jupyter
+jupytext
+pytest
+twine
+build
