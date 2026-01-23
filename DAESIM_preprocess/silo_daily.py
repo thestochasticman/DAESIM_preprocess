@@ -9,10 +9,13 @@
 import os
 import shutil
 import argparse
+import json
+from pathlib import Path
 
 # Dependencies
 import requests
 import xarray as xr
+import numpy as np
 
 # +
 # Taken from https://github.com/Sydney-Informatics-Hub/geodata-harvester/blob/main/src/geodata_harvester/getdata_silo.py
@@ -95,7 +98,69 @@ def silo_daily_multiyear(var="radiation", latitude=-34.3890427, longitude=148.46
     return ds_concat
 
 
-def silo_daily(variables=["radiation"], lat=-34.3890427, lon=148.469499, buffer=0.1, start_year="2020", end_year="2020", outdir=".", stub="TEST", tmpdir=".", thredds=None, save_netcdf=True, plot=True, verbose=True):
+def save_silo_daily_json(ds, outdir, stub, start_year, end_year, buffer, reducer='median', verbose=True):
+    """
+    Save SILO daily data as JSON for frontend consumption
+
+    Parameters
+    ----------
+        ds: xarray dataset with SILO daily variables
+        outdir: Directory to save the JSON file
+        stub: Filename prefix
+        start_year, end_year: Year range for metadata
+        buffer: Spatial buffer used for metadata
+        reducer: 'median', 'mean', 'min', 'max' - how to aggregate spatial data
+        verbose: Print output messages
+
+    Returns
+    -------
+        json_path: Path to the saved JSON file
+    """
+    # Aggregate spatially using the specified reducer
+    if reducer == 'median':
+        ds_point = ds.median(dim=['lat', 'lon'])
+    elif reducer == 'mean':
+        ds_point = ds.mean(dim=['lat', 'lon'])
+    elif reducer == 'min':
+        ds_point = ds.min(dim=['lat', 'lon'])
+    elif reducer == 'max':
+        ds_point = ds.max(dim=['lat', 'lon'])
+    else:
+        ds_point = ds.median(dim=['lat', 'lon'])  # default to median
+
+    # Convert to records format
+    data = []
+    for i, time_val in enumerate(ds_point.time.values):
+        row = {"time": str(time_val)[:10]}  # "YYYY-MM-DD"
+        for var in ds_point.data_vars:
+            val = float(ds_point[var].isel(time=i).values)
+            row[var] = None if np.isnan(val) else round(val, 2)
+        data.append(row)
+
+    # Create payload with metadata
+    payload = {
+        "meta": {
+            "start_year": start_year,
+            "end_year": end_year,
+            "buffer": buffer,
+            "reducer": reducer,
+            "variables": list(ds.data_vars.keys())
+        },
+        "data": data
+    }
+
+    # Save to JSON
+    json_path = Path(outdir) / f"{stub}_silo_daily.json"
+    with open(json_path, 'w') as f:
+        json.dump(payload, f, indent=2)
+
+    if verbose:
+        print(f"Saved JSON with {len(data)} records and {len(payload['meta']['variables'])} variables: {json_path}")
+
+    return json_path
+
+
+def silo_daily(variables=["radiation"], lat=-34.3890427, lon=148.469499, buffer=0.1, start_year="2020", end_year="2020", outdir=".", stub="TEST", tmpdir=".", thredds=None, save_netcdf=True, save_json=True, plot=True, reducer='median', verbose=True):
     """Download daily variables from SILO at 5km resolution for the region/time of interest
 
     Parameters
@@ -109,10 +174,13 @@ def silo_daily(variables=["radiation"], lat=-34.3890427, lon=148.469499, buffer=
         tmpdir: The directory that Australia wide SILO data gets downloaded. Each variable per year is ~400MB, so this can take a while to download. Use "/g/data/xe2/datasets/Climate_SILO" when running on NCI gadi under the xe2 project
         thredds: Unused - just an input for consistency with ozwald_daily.
         save_netcdf: Whether to save the xarray to file or not. This gets downloaded to 'outdir/(stub)_silo_daily.nc'.
-        
+        save_json: Save the data as JSON for frontend consumption
+        reducer: How to spatially aggregate data for JSON export ('median', 'mean', 'min', 'max')
+
     Returns
     -------
         ds_concat: an xarray containing the requested variables in the region of interest for the time period specified
+        A JSON file gets saved to outdir/(stub)_silo_daily.json if save_json=True
     """
     if verbose:
         print(f"Starting silo_daily for stub {stub}")
@@ -129,6 +197,9 @@ def silo_daily(variables=["radiation"], lat=-34.3890427, lon=148.469499, buffer=
         ds_concat.to_netcdf(filename, engine='h5netcdf')
         if verbose:
             print("Saved:", filename)
+
+    if save_json:
+        save_silo_daily_json(ds_concat, outdir, stub, start_year, end_year, buffer, reducer, verbose)
 
     if plot:
         # Copy pasting this between ozwald_daily, ozwald_8day and silo_daily. Not sure if it's worth creating an import, because small changes between the 3 API's keep cropping up.

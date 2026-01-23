@@ -7,10 +7,13 @@
 # Standard Libraries
 import os
 import argparse
+import json
+from pathlib import Path
 
 # Dependencies
 import requests
 import xarray as xr
+import numpy as np
 
 # +
 ozwald_daily_abbreviations = {
@@ -89,7 +92,69 @@ def ozwald_daily_multiyear(var="VPeff", latitude=-34.3890427, longitude=148.4694
     return ds_concat
 
 
-def ozwald_daily(variables=["VPeff", "Uavg"], lat=-34.3890427, lon=148.469499, buffer=0.1, start_year="2020", end_year="2021", outdir=".", stub="TEST", tmpdir=".", thredds=True, save_netcdf=True, plot=True, verbose=True):
+def save_ozwald_daily_json(ds, outdir, stub, start_year, end_year, buffer, reducer='median', verbose=True):
+    """
+    Save ozwald daily data as JSON for frontend consumption
+
+    Parameters
+    ----------
+        ds: xarray dataset with ozwald daily variables
+        outdir: Directory to save the JSON file
+        stub: Filename prefix
+        start_year, end_year: Year range for metadata
+        buffer: Spatial buffer used for metadata
+        reducer: 'median', 'mean', 'min', 'max' - how to aggregate spatial data
+        verbose: Print output messages
+
+    Returns
+    -------
+        json_path: Path to the saved JSON file
+    """
+    # Aggregate spatially using the specified reducer
+    if reducer == 'median':
+        ds_point = ds.median(dim=['latitude', 'longitude'])
+    elif reducer == 'mean':
+        ds_point = ds.mean(dim=['latitude', 'longitude'])
+    elif reducer == 'min':
+        ds_point = ds.min(dim=['latitude', 'longitude'])
+    elif reducer == 'max':
+        ds_point = ds.max(dim=['latitude', 'longitude'])
+    else:
+        ds_point = ds.median(dim=['latitude', 'longitude'])  # default to median
+
+    # Convert to records format
+    data = []
+    for i, time_val in enumerate(ds_point.time.values):
+        row = {"time": str(time_val)[:10]}  # "YYYY-MM-DD"
+        for var in ds_point.data_vars:
+            val = float(ds_point[var].isel(time=i).values)
+            row[var] = None if np.isnan(val) else round(val, 2)
+        data.append(row)
+
+    # Create payload with metadata
+    payload = {
+        "meta": {
+            "start_year": start_year,
+            "end_year": end_year,
+            "buffer": buffer,
+            "reducer": reducer,
+            "variables": list(ds.data_vars.keys())
+        },
+        "data": data
+    }
+
+    # Save to JSON
+    json_path = Path(outdir) / f"{stub}_ozwald_daily.json"
+    with open(json_path, 'w') as f:
+        json.dump(payload, f, indent=2)
+
+    if verbose:
+        print(f"Saved JSON with {len(data)} records and {len(payload['meta']['variables'])} variables: {json_path}")
+
+    return json_path
+
+
+def ozwald_daily(variables=["VPeff", "Uavg"], lat=-34.3890427, lon=148.469499, buffer=0.1, start_year="2020", end_year="2021", outdir=".", stub="TEST", tmpdir=".", thredds=True, save_netcdf=True, save_json=True, plot=True, reducer='median', verbose=True):
     """Download daily variables from OzWald at varying resolutions for the region/time of interest
 
     Parameters
@@ -102,11 +167,15 @@ def ozwald_daily(variables=["VPeff", "Uavg"], lat=-34.3890427, lon=148.469499, b
         stub: The name to be prepended to each file download.
         tmpdir: The directory that the temporary NetCDFs get saved when downloading from Thredds. This does not get used if Thredds=False.
         thredds: A boolean flag to choose between using the public facing API (slower but works locally), or running directly on NCI (requires access to the ub8 project)
-    
+        save_netcdf: Save the data as NetCDF file
+        save_json: Save the data as JSON for frontend consumption
+        reducer: How to spatially aggregate data for JSON export ('median', 'mean', 'min', 'max')
+
     Returns
     -------
         ds_concat: an xarray containing the requested variables in the region of interest for the time period specified
         A NetCDF file of this xarray gets downloaded to outdir/(stub)_ozwald_daily_(first_variable).nc'
+        A JSON file gets saved to outdir/(stub)_ozwald_daily.json if save_json=True
     """
     if verbose:
         print(f"Starting ozwald_daily")
@@ -123,7 +192,10 @@ def ozwald_daily(variables=["VPeff", "Uavg"], lat=-34.3890427, lon=148.469499, b
         ds_concat.to_netcdf(filename, engine='h5netcdf')
         if verbose:
             print("Saved:", filename)
-            
+
+    if save_json:
+        save_ozwald_daily_json(ds_concat, outdir, stub, start_year, end_year, buffer, reducer, verbose)
+
     if plot:
         import matplotlib.pyplot as plt
         variables = list(ds_concat.data_vars)
